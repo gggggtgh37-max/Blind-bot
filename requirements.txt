@@ -1,0 +1,5 @@
+pyTelegramBotAPI==4.31.0
+Flask
+requests
+psutil
+protobuf==4.25.1
