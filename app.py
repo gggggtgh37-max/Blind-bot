@@ -13,6 +13,8 @@ import requests
 import logging
 
 # Telegram imports
+from telegram import Update
+from telegram.ext import Application
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
@@ -25,7 +27,7 @@ from telegram.ext import (
 )
 
 # -------------------- BOT TOKEN (set at the start) --------------------
-BOT_TOKEN = "86135501OfSZ3mruM3i7ucxBzHLZN6aFU"
+BOT_TOKEN = "8987248629:AAF62VRz_yy88ZjOz3-TKtNaiNlkYSCm7a0"
 # ----------------------------------------------------------------------
 
 # Disable SSL warnings
