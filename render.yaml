@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: effective-octo-spoon
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PUBLIC_URL
+        value: https://effective-octo-spoon.onrender.com
+    plan: free
