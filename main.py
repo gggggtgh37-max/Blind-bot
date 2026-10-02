@@ -626,6 +626,111 @@ def _jwt_account_id(jwt: str) -> int:
     return 0
 
 
+def _parse_majorlogin_body(data: bytes):
+    """Extract account_id, region, token, url, server_time, aes_ak, iv_i from raw body."""
+    out = {
+        'account_id': 0, 'region': '', 'token': '', 'url': '',
+        'server_time': 0, 'aes_ak': b'', 'iv_i': b'',
+    }
+    if not data:
+        return out
+    jwt = _extract_jwt(data)
+    if jwt:
+        out['token'] = jwt
+        out['account_id'] = _jwt_account_id(jwt)
+
+    def read_varint(buf, i):
+        result = shift = 0
+        while i < len(buf):
+            b = buf[i]; i += 1
+            result |= (b & 0x7F) << shift
+            if not (b & 0x80):
+                break
+            shift += 7
+            if shift > 63:
+                break
+        return result, i
+
+    def parse_at(buf, start):
+        local = dict(out)
+        i, n = start, len(buf)
+        while i < n:
+            tag = buf[i]; i += 1
+            fn, wt = tag >> 3, tag & 7
+            if wt == 0:
+                val, i = read_varint(buf, i)
+                if fn == 1 and val > 0:
+                    local['account_id'] = val
+                elif fn in (18, 21) and val > 0:
+                    local['server_time'] = val
+            elif wt == 2:
+                ln, i = read_varint(buf, i)
+                if i + ln > n:
+                    break
+                raw = buf[i:i+ln]; i += ln
+                if fn == 2:
+                    local['region'] = raw.decode('utf-8', 'ignore')
+                elif fn == 8:
+                    s = raw.decode('utf-8', 'ignore')
+                    if s.startswith('eyJ') and len(s) > len(local.get('token') or ''):
+                        local['token'] = s
+                elif fn == 10:
+                    local['url'] = raw.decode('utf-8', 'ignore')
+                elif fn in (19, 22) and len(raw) in (16, 24, 32):
+                    local['aes_ak'] = raw
+                elif fn in (20, 23) and len(raw) in (16, 24, 32):
+                    local['iv_i'] = raw
+            elif wt == 5:
+                i += 4
+            elif wt == 1:
+                i += 8
+            else:
+                break
+        return local
+
+    best = out
+    best_score = 0
+    for off in [0] + list(range(1, min(96, len(data)))):
+        try:
+            cand = parse_at(data, off)
+        except Exception:
+            continue
+        score = 0
+        if cand.get('token') and str(cand['token']).startswith('eyJ'):
+            score += 50
+        if cand.get('url') and 'http' in str(cand['url']):
+            score += 20
+        if cand.get('account_id'):
+            score += 20
+        if len(cand.get('aes_ak') or b'') in (16, 24, 32):
+            score += 25
+        if len(cand.get('iv_i') or b'') in (16, 24, 32):
+            score += 25
+        if score > best_score:
+            best_score = score
+            best = cand
+    if best.get('token') and not best.get('account_id'):
+        best['account_id'] = _jwt_account_id(best['token'])
+    return best
+
+
+class _MajorLoginResult:
+    """Simple object matching fields used by process_account_* / run_account_worker."""
+    def __init__(self, d: dict):
+        self.account_id = int(d.get('account_id') or 0)
+        self.account_uid = self.account_id
+        self.region = d.get('region') or 'IND'
+        self.token = d.get('token') or ''
+        self.url = d.get('url') or 'https://client.ind.freefiremobile.com'
+        self.server_url = self.url
+        self.server_time = int(d.get('server_time') or 0) or int(__import__('time').time())
+        self.timestamp = self.server_time
+        self.aes_ak = d.get('aes_ak') or b''
+        self.iv_i = d.get('iv_i') or b''
+        self.key = self.aes_ak
+        self.iv = self.iv_i
+
+
 async def build_majorlogin_payload(open_id, access_token, platform, client_version, device_info):
     """OB55 MajorLogin body — field layout aligned with MajorLoginXGetLoginData."""
     try:
@@ -683,7 +788,7 @@ async def build_majorlogin_payload(open_id, access_token, platform, client_versi
 
 
 async def send_majorlogin(data, release_version, server_url, access_token: str = ""):
-    """POST MajorLogin using MajorLoginX-style headers + multi-host fallback."""
+    """POST MajorLogin — try Unity + GarenaMSDK headers, multi-host, robust parse."""
     if not data:
         return None
     hosts = [
@@ -692,108 +797,115 @@ async def send_majorlogin(data, release_version, server_url, access_token: str =
         'loginbp.ggpolarbear.com',
         'loginbp.ggwhitehawk.com',
     ]
-    # Prefer server_url host if present
     try:
         from urllib.parse import urlparse
-        u = urlparse(server_url if '://' in str(server_url) else f'https://{server_url}')
-        if u.hostname:
+        u = urlparse(server_url if '://' in str(server_url or '') else f'https://{server_url}')
+        if u.hostname and 'login' in (u.hostname or ''):
             hosts = [u.hostname] + [h for h in hosts if h != u.hostname]
     except Exception:
         pass
 
-    ua = random.choice(_GARENA_UAS)
     rv = release_version or 'OB55'
-    for host in hosts:
-        url = f'https://{host}/MajorLogin'
-        req_headers = {
-            'User-Agent': ua,
+    header_sets = [
+        {
+            'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
+            'Accept': '*/*',
+            'Accept-Encoding': 'deflate, gzip',
+            'X-GA-SV': '1789535859',
+            'X-GA': 'v1 1',
+            'ReleaseVersion': rv,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Unity-Version': '2018.4.12f1',
+            'Connection': 'Keep-Alive',
+        },
+        {
+            'User-Agent': random.choice(_GARENA_UAS),
             'Accept-Encoding': 'deflate, gzip',
             'X-GA-SV': '1789535859',
             'X-GA': 'v1 1',
             'ReleaseVersion': rv,
             'Content-Type': 'application/octet-stream',
             'X-Unity-Version': '2018.4.12f1',
-            'Host': host,
             'Connection': 'Keep-Alive',
-        }
-        if access_token:
-            req_headers['Authorization'] = f'Bearer {access_token}'
-        try:
-            response = await client.post(url, headers=req_headers, content=data, timeout=12.0)
-            body = response.content or b''
-            if b'Protection Bypass' in body:
-                print_warning(f'[MAJORLOGIN] Protection Bypass via {host}')
-                continue
-            if b'SignError' in body[:40]:
-                print_warning(f'[MAJORLOGIN] SignError via {host}')
-                continue
-            if response.status_code != 200 or len(body) < 20:
-                print_warning(f'[MAJORLOGIN] HTTP {response.status_code} via {host}')
-                continue
+        },
+    ]
 
-            # Parse with thunderFF + JWT fallback
-            res_proto = None
-            for offset in [0, 64] + list(range(1, min(96, len(body)))):
-                try:
-                    cand = thunderFF_pb2.MajorLoginRes()
-                    cand.ParseFromString(body[offset:])
-                    if getattr(cand, 'token', None) or getattr(cand, 'region', None):
-                        res_proto = cand
-                        break
-                except Exception:
+    last_err = ''
+    for host in hosts:
+        url = f'https://{host}/MajorLogin'
+        for base_hdr in header_sets:
+            req_headers = dict(base_hdr)
+            req_headers['Host'] = host
+            if access_token:
+                req_headers['Authorization'] = f'Bearer {access_token}'
+            try:
+                response = await client.post(url, headers=req_headers, content=data, timeout=12.0)
+                body = response.content or b''
+                if b'Protection Bypass' in body:
+                    last_err = f'Protection Bypass via {host}'
+                    print_warning(f'[MAJORLOGIN] {last_err}')
                     continue
-            if res_proto is None:
-                res_proto = thunderFF_pb2.MajorLoginRes()
+                if b'SignError' in body[:48]:
+                    last_err = f'SignError via {host}'
+                    print_warning(f'[MAJORLOGIN] {last_err}')
+                    continue
+                if response.status_code != 200 or len(body) < 20:
+                    last_err = f'HTTP {response.status_code} via {host}'
+                    print_warning(f'[MAJORLOGIN] {last_err}')
+                    continue
+
+                parsed = _parse_majorlogin_body(body)
+                # merge thunderFF parse if helpful
                 try:
-                    res_proto.ParseFromString(body)
+                    for offset in [0, 64]:
+                        if offset >= len(body):
+                            continue
+                        cand = thunderFF_pb2.MajorLoginRes()
+                        cand.ParseFromString(body[offset:])
+                        if getattr(cand, 'token', None) and not parsed.get('token'):
+                            parsed['token'] = cand.token
+                        if getattr(cand, 'url', None) and not parsed.get('url'):
+                            parsed['url'] = cand.url
+                        if getattr(cand, 'region', None) and not parsed.get('region'):
+                            parsed['region'] = cand.region
+                        if int(getattr(cand, 'account_id', 0) or 0) > 0 and not parsed.get('account_id'):
+                            parsed['account_id'] = int(cand.account_id)
+                        ak = getattr(cand, 'aes_ak', b'') or b''
+                        iv = getattr(cand, 'iv_i', b'') or b''
+                        if len(ak) in (16, 24, 32) and not parsed.get('aes_ak'):
+                            parsed['aes_ak'] = bytes(ak)
+                        if len(iv) in (16, 24, 32) and not parsed.get('iv_i'):
+                            parsed['iv_i'] = bytes(iv)
+                        st = int(getattr(cand, 'server_time', 0) or 0)
+                        if st and not parsed.get('server_time'):
+                            parsed['server_time'] = st
                 except Exception:
                     pass
 
-            jwt = getattr(res_proto, 'token', None) or _extract_jwt(body)
-            if jwt and not getattr(res_proto, 'token', None):
-                try:
-                    res_proto.token = jwt
-                except Exception:
-                    pass
-            # account_id from JWT if missing
-            aid = int(getattr(res_proto, 'account_id', 0) or getattr(res_proto, 'account_uid', 0) or 0)
-            if aid <= 0 and jwt:
-                aid = _jwt_account_id(jwt)
-                if aid:
-                    try:
-                        res_proto.account_id = aid
-                    except Exception:
-                        pass
-                    try:
-                        res_proto.account_uid = aid
-                    except Exception:
-                        pass
-            # aliases used downstream
-            if hasattr(res_proto, 'key') and not getattr(res_proto, 'aes_ak', None):
-                try:
-                    res_proto.aes_ak = res_proto.key
-                except Exception:
-                    pass
-            if hasattr(res_proto, 'iv') and not getattr(res_proto, 'iv_i', None):
-                try:
-                    res_proto.iv_i = res_proto.iv
-                except Exception:
-                    pass
-            if hasattr(res_proto, 'timestamp') and not getattr(res_proto, 'server_time', None):
-                try:
-                    res_proto.server_time = res_proto.timestamp
-                except Exception:
-                    pass
+                if not parsed.get('token'):
+                    last_err = f'no JWT via {host} (len={len(body)})'
+                    print_warning(f'[MAJORLOGIN] {last_err}')
+                    continue
 
-            if not jwt and not getattr(res_proto, 'token', None):
-                print_warning(f'[MAJORLOGIN] 200 but no JWT via {host} (len={len(body)})')
+                result = _MajorLoginResult(parsed)
+                if result.account_id <= 0:
+                    last_err = f'no account_id via {host}'
+                    print_warning(f'[MAJORLOGIN] {last_err}')
+                    continue
+                if not result.url:
+                    result.url = 'https://client.ind.freefiremobile.com'
+                    result.server_url = result.url
+                print_success(
+                    f'[MAJORLOGIN] 200 via {host} uid={result.account_id} '
+                    f'region={result.region} aes={len(result.aes_ak)} iv={len(result.iv_i)}'
+                )
+                return result
+            except Exception as e:
+                last_err = f'{host}: {e}'
+                print_warning(f'[MAJORLOGIN] error {last_err}')
                 continue
-
-            print_success(f'[MAJORLOGIN] 200 via {host} uid={getattr(res_proto, "account_id", 0)}')
-            return res_proto
-        except Exception as e:
-            print_warning(f'[MAJORLOGIN] error via {host}: {e}')
-            continue
+    if last_err:
+        print_error(f'[MAJORLOGIN] all hosts failed — last: {last_err}')
     return None
 
 
@@ -1979,6 +2091,10 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
         login_payload_data = await build_majorlogin_payload(open_id, access_token, platform, client_version, device_info)
         majorlogin_response = await send_majorlogin(login_payload_data, release_version, server_url, access_token)
         if majorlogin_response is None:
+            print_error('[LOGIN] MajorLogin failed on all hosts')
+            return None
+        if int(getattr(majorlogin_response, 'account_id', 0) or 0) <= 0:
+            print_error('[LOGIN] MajorLogin response missing account_id')
             return None
         getlogin_result = await send_getlogin(login_payload_data, majorlogin_response.url, majorlogin_response.token, release_version)
         if getlogin_result is None:
@@ -2080,6 +2196,10 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
 
         majorlogin_response = await send_majorlogin(login_payload_data, release_version, server_url, access_token)
         if majorlogin_response is None:
+            print_error('[LOGIN] MajorLogin failed on all hosts')
+            return None
+        if int(getattr(majorlogin_response, 'account_id', 0) or 0) <= 0:
+            print_error('[LOGIN] MajorLogin response missing account_id')
             return None
 
         getlogin_result = await send_getlogin(
