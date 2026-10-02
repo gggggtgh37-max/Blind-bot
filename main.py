@@ -4,6 +4,8 @@ import asyncio
 import httpx
 import random
 import json
+import base64
+import re
 import socket
 import struct
 import time
@@ -40,7 +42,7 @@ PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://effective-octo-spoon.onrender
 ACCOUNTS_FILE = "accounts.json"
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"  # 🔥 NEW: Persistent device storage
-TOKEN_CACHE_TTL = 1200
+TOKEN_CACHE_TTL = 86400
 
 # 🔥 Match control
 START_MATCH_INTERVAL = 3.0
@@ -561,137 +563,260 @@ async def decode_protobuf(data):
     parsed_results_dict = await parse_results(parsed_results)
     return json.dumps(parsed_results_dict)
 
+
+# ==================== OB55 MajorLogin (hand-encoded, from MajorLoginX) ====================
+_IND_ISP_IPS = [
+    "49.36.180.10", "49.36.180.22", "103.87.24.10", "103.87.25.14",
+    "115.99.10.20", "115.99.11.40", "49.36.100.10", "103.41.20.10",
+]
+_GARENA_UAS = [
+    "GarenaMSDK/4.0.44(25028RN03A ;Android 15;en;IN;app 1.132.1 2019121229;)",
+    "GarenaMSDK/4.0.43(25028RN03A ;Android 14;en;IN;app 1.131.1 2019121229;)",
+    "GarenaMSDK/4.0.42(25028RN03A ;Android 13;hi;IN;app 1.130.1 2019121229;)",
+]
+
+def _pb_varint(n: int) -> bytes:
+    if n < 0:
+        return b""
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            b |= 0x80
+        out.append(b)
+        if not n:
+            break
+    return bytes(out)
+
+def _pb_field(fn: int, val) -> bytes:
+    if isinstance(val, bool):
+        val = int(val)
+    if isinstance(val, int):
+        return _pb_varint((fn << 3) | 0) + _pb_varint(val)
+    if isinstance(val, str):
+        raw = val.encode("utf-8")
+        return _pb_varint((fn << 3) | 2) + _pb_varint(len(raw)) + raw
+    if isinstance(val, (bytes, bytearray)):
+        raw = bytes(val)
+        return _pb_varint((fn << 3) | 2) + _pb_varint(len(raw)) + raw
+    return b""
+
+def _pb_encode(fields: dict) -> bytes:
+    return b"".join(_pb_field(k, v) for k, v in fields.items())
+
+def _extract_jwt(body: bytes) -> str:
+    if not body:
+        return ""
+    m = re.search(rb"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+", body)
+    return m.group(0).decode("utf-8", "ignore") if m else ""
+
+def _jwt_account_id(jwt: str) -> int:
+    if not jwt or jwt.count(".") < 2:
+        return 0
+    try:
+        seg = jwt.split(".")[1]
+        seg += "=" * ((4 - len(seg) % 4) % 4)
+        data = json.loads(base64.urlsafe_b64decode(seg).decode("utf-8", "ignore"))
+        for k in ("account_id", "external_id", "uid", "accountId", "sub"):
+            if data.get(k) is not None:
+                return int(data[k])
+    except Exception:
+        pass
+    return 0
+
+
 async def build_majorlogin_payload(open_id, access_token, platform, client_version, device_info):
+    """OB55 MajorLogin body — field layout aligned with MajorLoginXGetLoginData."""
     try:
-        proto = thunderFF_pb2.MajorLoginReq()
-        proto.event_time = str(datetime.now())[:-7]
-        proto.game_name = "free fire"
-        proto.platform_id = 4 if str(platform) in ["4", "guest"] else (1 if str(platform) in ["1"] else int(platform) if str(platform).isdigit() else 4)
-        proto.client_version = client_version
-        proto.client_version_code = "2019121229"
-        
-        # --- INJECTING PERSISTENT DYNAMIC DEVICE DATA ---
-        proto.system_software = device_info.get("system_software", "Android OS 12 / API-31 (SP1A.210812.016.C2/user.dxu.20260701.180839)")
-        proto.system_hardware = device_info.get("brand", "Handheld")
-        proto.device_type = device_info.get("model", "Handheld")
-        proto.screen_width = int(device_info.get("screen_width", 1600))
-        proto.screen_height = int(device_info.get("screen_height", 900))
-        proto.screen_dpi = str(device_info.get("screen_dpi", "300"))
-        proto.processor_details = device_info.get("processor_details", "ARM64 FP ASIMD AES | 2400 | 8")
-        proto.memory = int(device_info.get("memory", 5951))
-        proto.gpu_renderer = device_info.get("gpu_renderer", "Adreno (TM) 640")
-        proto.unique_device_id = device_info.get("unique_device_id", "Google|725030d8-6585-4f55-bcca-a6df7e59935b")
-        proto.client_ip = device_info.get("client_ip", "103.145.112.210")
-        # ------------------------------------------------
-        
-        proto.telecom_operator = "Citycell"
-        proto.network_operator_a = "Citycell"
-        proto.network_type = "WIFI"
-        proto.network_type_a = "WIFI"
-        proto.cpu_type = 2
-        proto.cpu_architecture = "64"
-        proto.gpu_version = "OpenGL ES 3.2"
-        proto.graphics_api = "OpenGLES2"
-        proto.language = "en"
-        proto.open_id = open_id
-        proto.open_id_type = str(platform)
-        proto.login_open_id_type = int(platform)
-        proto.access_token = access_token
-        proto.login_by = 3
-        proto.platform_sdk_id = 2
-        proto.origin_platform_type = str(platform)
-        proto.primary_platform_type = str(platform)
-        proto.reg_avatar = 1
-        proto.channel_type = 3
-        
-        memory_available = proto.memory_available
-        memory_available.version = 55
-        memory_available.hidden_value = 81
-        
-        proto.external_storage_total = 34308
-        proto.external_storage_available = 30777
-        proto.internal_storage_total = 2519
-        proto.internal_storage_available = 243
-        proto.game_disk_storage_total = 34308
-        proto.game_disk_storage_available = 32224
-        proto.external_sdcard_total_storage = 34308
-        proto.external_sdcard_avail_storage = 32224
-        
-        proto.library_path = "/data/app/~~UKDdGuy32C5yOa0KZe_ROA==/com.dts.freefireth-UAKF1gjDbXSGfpA07JDTKQ==/lib/arm64"
-        proto.library_token = "b8e0cd5e295eee42f5860d3c86e483dd|/data/app/~~UKDdGuy32C5yOa0KZe_ROA==/com.dts.freefireth-UAKF1gjDbXSGfpA07JDTKQ==/base.apk"
-        proto.client_using_version = "7428b253defc164018c604a1ebbfebdf"
-        proto.supported_astc_bitset = 4095
-        proto.analytics_detail = b"FwQVTgUPX1UaUllDDwcWCRBpWAUOUgsvA1snWlBaO1kFYg=="
-        proto.loading_time = 14582
-        proto.release_channel = "android"
-        proto.extra_info = "KqsHT4tDHGqm9PQ3syB24XA4N6SWy/Q/HfMFTQM+SgxmVqsgPK138ajtCFyVNW/Q7p6hxoenpRjeZ2NphiIosCZ3YDkONB5NAa+zTwNo7iabx/mj"
-        proto.android_engine_init_flag = 111207
-        proto.if_push = 1
-        proto.is_vpn = 0
-        
-        payload = proto.SerializeToString()
-        return await aes_encrypt(payload, AES_KEY, AES_IV)
-    except Exception:
+        dev = device_info or {}
+        model = f"{dev.get('brand', 'Samsung')} {dev.get('model', 'SM-M135F')}"
+        os_ver = dev.get('system_software', 'Android OS 13 / API-33 (TP1A.220624.014)')
+        gpu = dev.get('gpu_renderer', 'Adreno (TM) 618')
+        udi = dev.get('unique_device_id') or f"Google|{uuid.uuid4()}"
+        cip = dev.get('client_ip') or random.choice(_IND_ISP_IPS)
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cv = client_version or '1.132.9'
+        # Hand-encoded fields (not thunderFF schema numbers)
+        fields = {
+            3: now,
+            4: 'free fire',
+            5: 4,  # guest platform
+            7: cv,
+            8: '2019116753',
+            9: os_ver,
+            10: 'Handheld',
+            11: model,
+            12: int(dev.get('screen_width', 1280)),
+            13: int(dev.get('screen_height', 720)),
+            14: str(dev.get('screen_dpi', '240')),
+            15: dev.get('processor_details', 'ARM64 FP ASIMD AES | 2400 | 8'),
+            16: int(dev.get('memory', 6000)),
+            17: gpu,
+            18: 'OpenGL ES 3.2',
+            19: udi,
+            20: cip,
+            21: 'en',
+            22: open_id,
+            23: '4',
+            24: 'Handheld',
+            25: model,
+            26: 'IND',
+            29: access_token,
+            30: 1,
+            41: 'Jio',
+            42: 'WIFI',
+            92: random.choice([19788, 20000, 21000]),
+            93: 'android_max',
+            97: 1,
+            98: 0,  # is_vpn off
+            99: '4',
+            100: '4',
+            104: 77149,
+            105: 1,
+        }
+        raw = _pb_encode(fields)
+        return await aes_encrypt(raw, AES_KEY, AES_IV)
+    except Exception as e:
+        print_error(f'build_majorlogin_payload error: {e}')
         return None
 
-async def send_majorlogin(data, release_version, server_url):
-    try:
-        url = f"{server_url}MajorLogin"
-        req_headers = headers.copy()
-        req_headers["ReleaseVersion"] = release_version
-        response = await client.post(url, headers=req_headers, data=data)
-        if response.status_code != 200:
-            return None
-        response_content = response.content
-        if b"Protection Bypass" in response_content:
-            print_warning("[MAJORLOGIN] Protection Bypass (anti-bot) — try fresh guest UID/password, not recycled token")
-            return None
-        if len(response_content) < 40:
-            return None
 
-        # 1. Direct parse
-        res_proto = thunderFF_pb2.MajorLoginRes()
+async def send_majorlogin(data, release_version, server_url, access_token: str = ""):
+    """POST MajorLogin using MajorLoginX-style headers + multi-host fallback."""
+    if not data:
+        return None
+    hosts = [
+        'loginbp.ppmainecoonghj.com',
+        'loginbp.ggblueshark.com',
+        'loginbp.ggpolarbear.com',
+        'loginbp.ggwhitehawk.com',
+    ]
+    # Prefer server_url host if present
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(server_url if '://' in str(server_url) else f'https://{server_url}')
+        if u.hostname:
+            hosts = [u.hostname] + [h for h in hosts if h != u.hostname]
+    except Exception:
+        pass
+
+    ua = random.choice(_GARENA_UAS)
+    rv = release_version or 'OB55'
+    for host in hosts:
+        url = f'https://{host}/MajorLogin'
+        req_headers = {
+            'User-Agent': ua,
+            'Accept-Encoding': 'deflate, gzip',
+            'X-GA-SV': '1789535859',
+            'X-GA': 'v1 1',
+            'ReleaseVersion': rv,
+            'Content-Type': 'application/octet-stream',
+            'X-Unity-Version': '2018.4.12f1',
+            'Host': host,
+            'Connection': 'Keep-Alive',
+        }
+        if access_token:
+            req_headers['Authorization'] = f'Bearer {access_token}'
         try:
-            res_proto.ParseFromString(response_content)
-            if res_proto.region and res_proto.token:
-                return res_proto
-        except Exception:
-            pass
+            response = await client.post(url, headers=req_headers, content=data, timeout=12.0)
+            body = response.content or b''
+            if b'Protection Bypass' in body:
+                print_warning(f'[MAJORLOGIN] Protection Bypass via {host}')
+                continue
+            if b'SignError' in body[:40]:
+                print_warning(f'[MAJORLOGIN] SignError via {host}')
+                continue
+            if response.status_code != 200 or len(body) < 20:
+                print_warning(f'[MAJORLOGIN] HTTP {response.status_code} via {host}')
+                continue
 
-        # 2. OB55 64-byte header offset check
-        if len(response_content) > 64:
-            try:
+            # Parse with thunderFF + JWT fallback
+            res_proto = None
+            for offset in [0, 64] + list(range(1, min(96, len(body)))):
+                try:
+                    cand = thunderFF_pb2.MajorLoginRes()
+                    cand.ParseFromString(body[offset:])
+                    if getattr(cand, 'token', None) or getattr(cand, 'region', None):
+                        res_proto = cand
+                        break
+                except Exception:
+                    continue
+            if res_proto is None:
                 res_proto = thunderFF_pb2.MajorLoginRes()
-                res_proto.ParseFromString(response_content[64:])
-                if res_proto.region and res_proto.token:
-                    return res_proto
-            except Exception:
-                pass
+                try:
+                    res_proto.ParseFromString(body)
+                except Exception:
+                    pass
 
-        # 3. Dynamic offset search for OB55 compatibility
-        for offset in range(min(128, len(response_content))):
-            try:
-                candidate = thunderFF_pb2.MajorLoginRes()
-                candidate.ParseFromString(response_content[offset:])
-                if candidate.region and candidate.token:
-                    return candidate
-            except Exception:
-                pass
+            jwt = getattr(res_proto, 'token', None) or _extract_jwt(body)
+            if jwt and not getattr(res_proto, 'token', None):
+                try:
+                    res_proto.token = jwt
+                except Exception:
+                    pass
+            # account_id from JWT if missing
+            aid = int(getattr(res_proto, 'account_id', 0) or getattr(res_proto, 'account_uid', 0) or 0)
+            if aid <= 0 and jwt:
+                aid = _jwt_account_id(jwt)
+                if aid:
+                    try:
+                        res_proto.account_id = aid
+                    except Exception:
+                        pass
+                    try:
+                        res_proto.account_uid = aid
+                    except Exception:
+                        pass
+            # aliases used downstream
+            if hasattr(res_proto, 'key') and not getattr(res_proto, 'aes_ak', None):
+                try:
+                    res_proto.aes_ak = res_proto.key
+                except Exception:
+                    pass
+            if hasattr(res_proto, 'iv') and not getattr(res_proto, 'iv_i', None):
+                try:
+                    res_proto.iv_i = res_proto.iv
+                except Exception:
+                    pass
+            if hasattr(res_proto, 'timestamp') and not getattr(res_proto, 'server_time', None):
+                try:
+                    res_proto.server_time = res_proto.timestamp
+                except Exception:
+                    pass
 
-        res_proto = thunderFF_pb2.MajorLoginRes()
-        res_proto.ParseFromString(response_content)
-        return res_proto
-    except Exception:
-        return None
+            if not jwt and not getattr(res_proto, 'token', None):
+                print_warning(f'[MAJORLOGIN] 200 but no JWT via {host} (len={len(body)})')
+                continue
+
+            print_success(f'[MAJORLOGIN] 200 via {host} uid={getattr(res_proto, "account_id", 0)}')
+            return res_proto
+        except Exception as e:
+            print_warning(f'[MAJORLOGIN] error via {host}: {e}')
+            continue
+    return None
+
 
 async def send_getlogin(data, base_url, token, release_version):
     try:
-        url = f"{base_url.rstrip('/')}/GetLoginData"
-        req_headers = headers.copy()
-        req_headers["ReleaseVersion"] = release_version
-        req_headers['Authorization'] = f"Bearer {token}"
-        req_headers['Host'] = "clientbp.ppmainecoonghj.com"
-        response = await client.post(url, headers=req_headers, data=data)
+        base = (base_url or 'https://client.ind.freefiremobile.com').rstrip('/')
+        if not base.startswith('http'):
+            base = 'https://' + base
+        url = f"{base}/GetLoginData"
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or 'client.ind.freefiremobile.com'
+        req_headers = {
+            'Host': host,
+            'User-Agent': 'UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
+            'Accept': '*/*',
+            'Accept-Encoding': 'deflate, gzip',
+            'Authorization': f'Bearer {token}',
+            'X-GA': 'v1 1',
+            'ReleaseVersion': release_version or 'OB55',
+            'Content-Type': 'application/octet-stream',
+            'X-Unity-Version': '2022.3.47f1',
+        }
+        response = await client.post(url, headers=req_headers, content=data)
         if response.status_code != 200:
             return None
         response_content = response.content
@@ -1289,6 +1414,13 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 bot_state.increment_match(uid_str)
             except Exception:
                 pass
+            # Real EXP only — refresh profile from GetLoginData after each match
+            try:
+                ad = bot_state.account_credentials.get(uid_str)
+                if ad:
+                    asyncio.create_task(refresh_account_profile(ad))
+            except Exception:
+                pass
         ping_stop.set()
         if ping_task:
             ping_task.cancel()
@@ -1745,21 +1877,70 @@ async def refresh_account_profile(account_data_or_uid: Any):
             return
 
         res = await send_getlogin(payload, url, token, release_version)
-        if res:
-            res_proto, dict_res = res
-            level = int(get_proto_field(dict_res, 6, 1))
-            exp = int(get_proto_field(dict_res, 7, 0))
-            likes = int(get_proto_field(dict_res, 8, 0))
-            nickname = res_proto.nickname or get_proto_field(dict_res, 4, "")
+        if not res:
+            return
+        res_proto, dict_res = res
 
-            acc_id = str(account_data['account_id'])
-            if exp > 0:
-                bot_state.update_exp(acc_id, exp, level)
-            if likes > 0 and acc_id in bot_state.accounts:
-                bot_state.accounts[acc_id]["likes"] = likes
-            if nickname and acc_id in bot_state.accounts:
-                bot_state.accounts[acc_id]["nickname"] = nickname
-            print_info(f"[EXP-REFRESH] UID {acc_id} -> Level: {level}, EXP: {exp}")
+        # Real profile fields from GetLoginData (server only)
+        level = int(
+            get_proto_field(dict_res, 6, None)
+            or getattr(res_proto, "level", None)
+            or get_proto_field(dict_res, 5, None)
+            or 0
+        )
+        exp = int(
+            get_proto_field(dict_res, 7, None)
+            or getattr(res_proto, "exp", None)
+            or get_proto_field(dict_res, 15, None)
+            or get_proto_field(dict_res, 16, None)
+            or get_proto_field(dict_res, 9, None)
+            or 0
+        )
+        # Fallback: scan numeric leaf fields for a plausible exp if still 0
+        if exp <= 0 and isinstance(dict_res, dict):
+            candidates = []
+            def _walk(obj, depth=0):
+                if depth > 4 or not isinstance(obj, dict):
+                    return
+                for k, v in obj.items():
+                    if isinstance(v, dict):
+                        if "data" in v and isinstance(v["data"], (int, float)) and not isinstance(v["data"], bool):
+                            n = int(v["data"])
+                            if 50 < n < 50_000_000:
+                                candidates.append(n)
+                        else:
+                            _walk(v, depth + 1)
+            _walk(dict_res)
+            # Prefer values near previous current_exp
+            prev = 0
+            try:
+                prev = int(bot_state.accounts.get(str(account_data.get("account_id")), {}).get("current_exp", 0) or 0)
+            except Exception:
+                pass
+            if candidates:
+                if prev > 0:
+                    near = [c for c in candidates if c >= prev]
+                    exp = min(near) if near else max(candidates)
+                else:
+                    exp = max(candidates)
+        likes = int(get_proto_field(dict_res, 8, 0) or 0)
+        nickname = (
+            getattr(res_proto, "nickname", None)
+            or get_proto_field(dict_res, 4, "")
+            or ""
+        )
+
+        acc_id = str(account_data['account_id'])
+        if level > 0 or exp > 0:
+            cur = bot_state.accounts.get(acc_id, {})
+            use_exp = exp if exp > 0 else int(cur.get("current_exp", 0) or 0)
+            use_level = level if level > 0 else int(cur.get("level", 1) or 1)
+            bot_state.update_exp(acc_id, use_exp, use_level)
+        if likes > 0 and acc_id in bot_state.accounts:
+            bot_state.accounts[acc_id]["likes"] = likes
+        if nickname and acc_id in bot_state.accounts:
+            bot_state.accounts[acc_id]["nickname"] = nickname
+        print_info(f"[EXP-REFRESH] UID {acc_id} -> Level: {level}, EXP: {exp} (server)")
     except Exception as e:
         print_error(f"refresh_account_profile error: {e}")
 
@@ -1796,7 +1977,7 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
         device_info = get_device_for_account(uid)
         
         login_payload_data = await build_majorlogin_payload(open_id, access_token, platform, client_version, device_info)
-        majorlogin_response = await send_majorlogin(login_payload_data, release_version, server_url)
+        majorlogin_response = await send_majorlogin(login_payload_data, release_version, server_url, access_token)
         if majorlogin_response is None:
             return None
         getlogin_result = await send_getlogin(login_payload_data, majorlogin_response.url, majorlogin_response.token, release_version)
@@ -1897,7 +2078,7 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
         if not login_payload_data:
             return None
 
-        majorlogin_response = await send_majorlogin(login_payload_data, release_version, server_url)
+        majorlogin_response = await send_majorlogin(login_payload_data, release_version, server_url, access_token)
         if majorlogin_response is None:
             return None
 
@@ -1990,7 +2171,7 @@ async def run_account_worker(account_data: Dict, label: str):
 
         async def exp_refresher():
             while True:
-                await asyncio.sleep(90)
+                await asyncio.sleep(30)
                 fresh = bot_state.account_credentials.get(acc_id)
                 if fresh:
                     await refresh_account_profile(fresh)
@@ -2029,25 +2210,30 @@ async def run_account_worker(account_data: Dict, label: str):
 
 
 async def account_loop_guest(uid: str, password: str):
+    """Login once, then keep restarting matches on same session (no logout)."""
+    account_data = None
     while True:
         try:
-            print_info(f"[LOGIN] Starting login for Guest UID: {uid}...")
-            try:
-                bot_state.update_status(str(uid), "CONNECTING")
-            except Exception:
-                pass
-            account_data = await process_account_uid_pass(uid, password)
-            if not account_data:
-                print_error(f"Login failed for UID: {uid}. Retrying in 15 seconds...")
+            if account_data is None:
+                print_info(f"[LOGIN] Starting login for Guest UID: {uid}...")
                 try:
-                    bot_state.update_status(str(uid), "ERROR")
+                    bot_state.update_status(str(uid), "CONNECTING")
                 except Exception:
                     pass
-                await asyncio.sleep(15)
-                continue
+                account_data = await process_account_uid_pass(uid, password)
+                if not account_data:
+                    print_error(f"Login failed for UID: {uid}. Retrying in 15 seconds...")
+                    try:
+                        bot_state.update_status(str(uid), "ERROR")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(15)
+                    continue
+                print_success(f"[SESSION] UID {uid} logged in — starting matches (no re-login)")
 
             await run_account_worker(account_data, uid)
-            print_warning(f"Session finished for {uid}. Reconnecting in 3s...")
+            # Same session: do NOT clear account_data / do NOT MajorLogin again
+            print_warning(f"[SESSION] Worker paused for {uid}. Restarting game in 3s (same login)...")
             await asyncio.sleep(3)
         except asyncio.CancelledError:
             print_warning(f"Worker for {uid} stopped.")
@@ -2057,30 +2243,34 @@ async def account_loop_guest(uid: str, password: str):
                 pass
             break
         except Exception as e:
-            print_error(f"Error for UID {uid}: {e}. Retrying in 10s...")
+            print_error(f"Error for UID {uid}: {e}. Retrying in 10s (keeping session)...")
             await asyncio.sleep(10)
 
 
 async def account_loop_token(token: str):
+    """Login once, then keep matches on same session (no logout/re-login)."""
     token_label = token[:10]
+    account_data = None
     while True:
         try:
-            print_info("[LOGIN] Starting login with Access Token...")
-            account_data = await process_account_token(token)
-            if not account_data:
-                print_error("Login failed for Token. Retrying in 15 seconds...")
-                await asyncio.sleep(15)
-                continue
+            if account_data is None:
+                print_info("[LOGIN] Starting login with Access Token...")
+                account_data = await process_account_token(token)
+                if not account_data:
+                    print_error("Login failed for Token. Retrying in 15 seconds...")
+                    await asyncio.sleep(15)
+                    continue
+                print_success(f"[SESSION] Token {token_label}... logged in — starting matches (no re-login)")
 
             acc_id = str(account_data['account_id'])
             await run_account_worker(account_data, acc_id)
-            print_warning("Token session finished. Reconnecting in 3s...")
+            print_warning("[SESSION] Worker paused. Restarting game in 3s (same login)...")
             await asyncio.sleep(3)
         except asyncio.CancelledError:
             print_warning(f"Worker for token {token_label} stopped.")
             break
         except Exception as e:
-            print_error(f"Token error: {e}. Retrying in 10s...")
+            print_error(f"Token error: {e}. Retrying in 10s (keeping session)...")
             await asyncio.sleep(10)
 
 
