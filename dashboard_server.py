@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FreeFire Level Up Bot - Professional Web Dashboard & Real-Time EXP Tracker
+AGS COMMUNITY - Free Fire Level Up Control Panel
 Embedded Async Web Server (aiohttp)
 """
 
@@ -45,8 +45,6 @@ class BotState:
                 "level": level or 1,
                 "initial_exp": exp,
                 "current_exp": exp,
-                "estimated_exp": exp,
-                "server_exp": exp,
                 "gained_exp": 0,
                 "likes": likes or 0,
                 "status": "ONLINE",
@@ -71,29 +69,19 @@ class BotState:
         self.recalc_totals()
 
     def update_exp(self, uid: str, current_exp: int, level: Optional[int] = None):
-        """Update from REAL server values only (GetLoginData)."""
         uid_str = str(uid)
-        if uid_str not in self.accounts:
-            return
-        acc = self.accounts[uid_str]
-        old_exp = int(acc.get("current_exp", 0) or 0)
-        server_exp = int(current_exp or 0)
-        if server_exp > 0:
-            acc["current_exp"] = server_exp
-            acc["server_exp"] = server_exp
-        if level is not None and int(level) > 0:
-            acc["level"] = int(level)
-        acc["gained_exp"] = max(0, int(acc.get("current_exp", 0) or 0) - int(acc.get("initial_exp", 0) or 0))
-        acc["last_updated"] = time.strftime("%H:%M:%S")
-        diff = int(acc.get("current_exp", 0) or 0) - old_exp
-        if diff > 0:
-            self.log(
-                f"Account {acc['nickname']} ({uid_str}) +{diff} EXP (server). "
-                f"Total Gained: +{acc['gained_exp']}",
-                "success",
-                uid_str,
-            )
-        self.recalc_totals()
+        if uid_str in self.accounts:
+            acc = self.accounts[uid_str]
+            old_exp = acc["current_exp"]
+            acc["current_exp"] = current_exp
+            if level is not None and level > 0:
+                acc["level"] = level
+            acc["gained_exp"] = max(0, current_exp - acc["initial_exp"])
+            acc["last_updated"] = time.strftime("%H:%M:%S")
+            diff = current_exp - old_exp
+            if diff > 0:
+                self.log(f"Account {acc['nickname']} ({uid_str}) gained +{diff} EXP! Total Gained: +{acc['gained_exp']}", "success", uid_str)
+            self.recalc_totals()
 
     def update_status(self, uid: str, status: str, active_matches: Optional[int] = None):
         uid_str = str(uid)
@@ -120,7 +108,6 @@ bot_state = BotState()
 
 
 # ==================== HTTP HANDLERS ====================
-
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "index.html")
 
 async def handle_index(request: web.Request) -> web.Response:
@@ -128,7 +115,7 @@ async def handle_index(request: web.Request) -> web.Response:
         with open(TEMPLATE_PATH, "r", encoding="utf-8") as f:
             content = f.read()
     else:
-        content = "<h1>templates/index.html not found!</h1>"
+        content = "<h1>AGS COMMUNITY - templates/index.html not found!</h1>"
     return web.Response(text=content, content_type="text/html", charset="utf-8")
 
 
@@ -177,8 +164,7 @@ async def handle_add_account(request: web.Request) -> web.Response:
             json.dump(existing, f, indent=2)
 
         bot_state.log(f"New account added: {data.get('uid') or 'Token'}", "success")
-        
-        # Trigger dynamic worker launch
+
         if "on_account_added" in bot_state.refresh_callbacks:
             asyncio.create_task(bot_state.refresh_callbacks["on_account_added"](data))
 
@@ -223,7 +209,7 @@ async def handle_refresh_account(request: web.Request) -> web.Response:
         return web.json_response({"status": "error", "error": str(e)})
 
 
-async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
+async def start_web_dashboard(host: str = "0.0.0.0", port: int = 20335):
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/stats", handle_get_stats)
@@ -235,4 +221,4 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
-    print(f"\033[92m[+] Web Dashboard running on http://localhost:{port}\033[0m")
+    print(f"\033[92m[+] AGS COMMUNITY Dashboard live on port {port}\033[0m")
